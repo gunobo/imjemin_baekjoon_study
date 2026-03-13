@@ -17,7 +17,6 @@ int main() {
             adj[a].push_back(b); adj[b].push_back(a);
         }
 
-        // BFS from 1 to find parent array + order
         vector<int> par(n+1, -1); par[1] = 0;
         vector<int> bfs_order;
         {
@@ -30,26 +29,24 @@ int main() {
             }
         }
 
-        // Reconstruct path 1 -> t
         vector<int> path;
         for (int v = t; v != 0; v = par[v]) path.push_back(v);
         reverse(path.begin(), path.end());
         set<int> path_set(path.begin(), path.end());
         int K = path.size();
 
-        // Bottom-up DP for off-path nodes:
-        //   si_gain[v] = optimal HP gain visiting v's subtree (with enough HP)
-        //   si_need[v] = min HP at v's entry to achieve si_gain[v]
-        //   sorted_ch[v] = profitable children sorted by ENTRY COST ascending
-        //                  (entry cost = max(0, -val[child]))
         vector<ll> si_gain(n+1, 0), si_need(n+1, 0);
-        vector<vector<pair<ll,int>>> sorted_ch(n+1);
+        // pg0[v] = partial_gain(v, 0): gain when entering v with HP=0
+        //   = LLONG_MIN if entry_cost[v] > 0 (can't enter)
+        //   = val[v] + sum of max(0, pg0[c]) for c where entry_cost[c]=0
+        //   Note: entry_cost[v]=max(0,-val[v])=0 iff val[v]>=0
+        vector<ll> pg0(n+1, LLONG_MIN);
+        vector<vector<int>> children(n+1); // profitable off-path children (for unlock)
 
         for (int i = (int)bfs_order.size()-1; i >= 0; i--) {
             int v = bfs_order[i];
             if (path_set.count(v)) continue;
 
-            // Collect profitable children, sorted by si_need for DP
             vector<pair<ll,int>> ch_dp;
             for (int u : adj[v]) {
                 if (u == par[v] || path_set.count(u)) continue;
@@ -57,7 +54,6 @@ int main() {
             }
             sort(ch_dp.begin(), ch_dp.end());
 
-            // Compute si_need, si_gain using si_need-sorted order
             ll need = max(0LL, -val[v]);
             ll running = need + val[v];
             for (auto& [cn, c] : ch_dp) {
@@ -66,41 +62,59 @@ int main() {
             }
             si_need[v] = need;
             si_gain[v] = val[v];
-            for (auto& [cn, c] : ch_dp) si_gain[v] += si_gain[c];
+            for (auto& [cn, c] : ch_dp) {
+                si_gain[v] += si_gain[c];
+                children[v].push_back(c);
+            }
 
-            // Build runtime sorted_ch by entry cost (for partial_gain)
-            vector<pair<ll,int>> ch_ec;
-            for (auto& [cn, c] : ch_dp)
-                ch_ec.push_back({max(0LL, -val[c]), c});
-            sort(ch_ec.begin(), ch_ec.end());
-            sorted_ch[v] = ch_ec;
+            // pg0[v]: gain when entering v with HP=0
+            if (val[v] >= 0) {
+                // entry_cost=0, can enter with HP=0
+                ll g = val[v];
+                for (auto& [cn, c] : ch_dp) {
+                    // only children reachable with HP=val[v]+... 
+                    // with entry HP=0, after visiting v: running HP = val[v]
+                    // but we need to compute this greedily by entry cost
+                    // Actually pg0[v] considers entry with H=0, so after v: H'=0+val[v]=val[v]>=0
+                    // children with entry_cost[c] <= val[v] are reachable
+                    // This recursion is complex. Simple bound: only free children (entry=0 = val[c]>=0)
+                    if (val[c] >= 0 && pg0[c] != LLONG_MIN) {
+                        // can visit c with running HP = current running
+                        // for simplicity, use pg0 of val>=0 children
+                        g += max(0LL, pg0[c]);
+                    }
+                }
+                pg0[v] = g;
+            } else {
+                pg0[v] = LLONG_MIN; // can't enter with HP=0
+            }
         }
 
-        // partial_gain(v, H): best gain achievable entering v with HP=H
-        // Uses entry cost to determine which children can be visited
-        function<ll(int, ll)> partial_gain = [&](int v, ll H) -> ll {
-            ll running = H + val[v];
-            ll gain = val[v];
-            for (auto& [ec, c] : sorted_ch[v]) {
-                if (running < ec) break;  // sorted by entry cost; all later also fail
-                ll pg = partial_gain(c, running);
-                if (pg > 0) { running += pg; gain += pg; }
+        // si_thr[v]: min HP to guarantee net gain >= 0 from visiting v
+        // val[v]>=0: 0
+        // val[v]<0: check if entering with H=entry_cost gives net>0
+        //   H=entry_cost, hp_after=0. Free children (val[c]>=0) reachable with hp=0.
+        //   free_gain = sum of pg0[c] for c with val[c]>=0
+        //   if free_gain > |val[v]|: si_thr = entry_cost
+        //   else: si_thr = si_need[v]
+        auto get_thr = [&](int v) -> ll {
+            if (val[v] >= 0) return 0LL;
+            ll entry = -val[v];
+            ll free_gain = 0;
+            for (int c : children[v]) {
+                if (val[c] >= 0 && pg0[c] != LLONG_MIN)
+                    free_gain += max(0LL, pg0[c]);
             }
-            return gain;
+            return (free_gain > entry) ? entry : si_need[v];
         };
 
-        // PQ: (HP threshold to try visiting, node)
-        // Nodes are pushed with entry cost initially.
-        // If partial_gain is unprofitable now, pushed back with si_need threshold
-        // (guaranteeing full gain when that threshold is met).
         using T2 = pair<ll, int>;
         priority_queue<T2, vector<T2>, greater<T2>> pq;
-        set<int> in_pq;
+        vector<bool> visited(n+1, false);
 
-        auto try_push = [&](int node, ll threshold) {
-            if (si_gain[node] <= 0 || in_pq.count(node)) return;
-            in_pq.insert(node);
-            pq.push({threshold, node});
+        auto try_push = [&](int node) {
+            if (si_gain[node] <= 0 || visited[node]) return;
+            pq.push({get_thr(node), node});
         };
 
         auto unlock_at = [&](int pi) {
@@ -109,7 +123,7 @@ int main() {
             int next_v = (pi+1 < K) ? path[pi+1] : -1;
             for (int u : adj[v]) {
                 if (u == prev_v || u == next_v || path_set.count(u)) continue;
-                try_push(u, max(0LL, -val[u]));
+                try_push(u);
             }
         };
 
@@ -121,20 +135,10 @@ int main() {
                 auto [need, node] = pq.top();
                 if (need > hp) break;
                 pq.pop();
-                in_pq.erase(node);
-
-                ll pg = partial_gain(node, hp);
-                if (pg < 0 || (pg == 0 && val[node] < 0)) {
-                    // Not profitable at current HP; re-queue at si_need threshold
-                    if (hp < si_need[node]) {
-                        in_pq.insert(node);
-                        pq.push({si_need[node], node});
-                    }
-                    continue;
-                }
+                if (visited[node]) continue;
+                visited[node] = true;
                 hp += val[node];
-                for (auto& [ec, c] : sorted_ch[node])
-                    try_push(c, max(0LL, -val[c]));
+                for (int c : children[node]) try_push(c);
             }
         };
 
